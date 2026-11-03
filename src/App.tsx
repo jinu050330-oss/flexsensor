@@ -1,4 +1,14 @@
-const sensorReadings = [
+import { useEffect, useRef, useState } from "react"
+
+type SensorReading = { time: string; value: number }
+type SerialPortLike = {
+  open: (options: { baudRate: number }) => Promise<void>
+  close: () => Promise<void>
+  readable: ReadableStream<Uint8Array> | null
+}
+type WebSerialApi = { requestPort: () => Promise<SerialPortLike> }
+
+const demoReadings: SensorReading[] = [
   { time: "09:00", value: 42 },
   { time: "09:30", value: 48 },
   { time: "10:00", value: 45 },
@@ -19,27 +29,6 @@ const chartPadding = { top: 24, right: 18, bottom: 40, left: 48 }
 const minScale = 20
 const maxScale = 100
 
-const points = sensorReadings.map((reading, index) => {
-  const x =
-    chartPadding.left +
-    (index / (sensorReadings.length - 1)) *
-      (chartWidth - chartPadding.left - chartPadding.right)
-  const y =
-    chartPadding.top +
-    ((maxScale - reading.value) / (maxScale - minScale)) *
-      (chartHeight - chartPadding.top - chartPadding.bottom)
-
-  return { ...reading, x, y }
-})
-
-const linePath = points
-  .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
-  .join(" ")
-
-const areaPath = `${linePath} L ${points.at(-1)?.x} ${
-  chartHeight - chartPadding.bottom
-} L ${points[0].x} ${chartHeight - chartPadding.bottom} Z`
-
 function StatusDot() {
   return (
     <span className="relative flex h-2.5 w-2.5" aria-hidden="true">
@@ -49,8 +38,34 @@ function StatusDot() {
   )
 }
 
-function SensorChart() {
+function SensorChart({ readings }: { readings: SensorReading[] }) {
   const gridValues = [100, 80, 60, 40, 20]
+  const values = readings.map((reading) => reading.value)
+  const rawMin = values.length ? Math.min(...values) : minScale
+  const rawMax = values.length ? Math.max(...values) : maxScale
+  const padding = Math.max((rawMax - rawMin) * 0.1, 1)
+  const scaleMin = Math.min(0, rawMin - padding)
+  const scaleMax = rawMax + padding
+  const points = readings.map((reading, index) => {
+    const x =
+      chartPadding.left +
+      (readings.length < 2
+        ? 1
+        : index / (readings.length - 1)) *
+        (chartWidth - chartPadding.left - chartPadding.right)
+    const y =
+      chartPadding.top +
+      ((scaleMax - reading.value) / (scaleMax - scaleMin)) *
+        (chartHeight - chartPadding.top - chartPadding.bottom)
+    return { ...reading, x, y }
+  })
+  const linePath = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
+    .join(" ")
+  const areaPath = points.length
+    ? `${linePath} L ${points.at(-1)?.x} ${chartHeight - chartPadding.bottom} L ${points[0].x} ${chartHeight - chartPadding.bottom} Z`
+    : ""
+  const labelStep = Math.max(1, Math.ceil(points.length / 6))
 
   return (
     <div className="mt-8 overflow-x-auto pb-1">
@@ -58,7 +73,7 @@ function SensorChart() {
         className="h-[300px] min-w-[720px] w-full"
         viewBox={`0 0 ${chartWidth} ${chartHeight}`}
         role="img"
-        aria-label="오전 9시부터 오후 2시 30분까지 굽힘 센서값이 42도에서 78도로 변화한 선 그래프"
+        aria-label="최근 센서값 변화 그래프"
       >
         <defs>
           <linearGradient id="sensor-area" x1="0" y1="0" x2="0" y2="1">
@@ -82,10 +97,15 @@ function SensorChart() {
           </filter>
         </defs>
 
-        {gridValues.map((value) => {
+        {Array.from(
+          { length: values.length ? 5 : gridValues.length },
+          (_, index) => {
+          const value = values.length
+            ? scaleMax - ((scaleMax - scaleMin) * index) / 4
+            : gridValues[index]
           const y =
             chartPadding.top +
-            ((maxScale - value) / (maxScale - minScale)) *
+            ((scaleMax - value) / (scaleMax - scaleMin)) *
               (chartHeight - chartPadding.top - chartPadding.bottom)
 
           return (
@@ -104,13 +124,14 @@ function SensorChart() {
                 textAnchor="end"
                 className="fill-slate-400 text-[11px]"
               >
-                {value}°
+                {Number.isInteger(value) ? value : value.toFixed(1)}
               </text>
             </g>
           )
-        })}
+          },
+        )}
 
-        <path d={areaPath} fill="url(#sensor-area)" />
+        {areaPath && <path d={areaPath} fill="url(#sensor-area)" />}
         <path
           d={linePath}
           fill="none"
@@ -121,8 +142,8 @@ function SensorChart() {
         />
 
         {points.map((point, index) => (
-          <g key={point.time}>
-            {(index % 2 === 0 || index === points.length - 1) && (
+          <g key={`${point.time}-${index}`}>
+            {(index % labelStep === 0 || index === points.length - 1) && (
               <text
                 x={point.x}
                 y={chartHeight - 12}
@@ -157,6 +178,124 @@ function SensorChart() {
 }
 
 export default function App() {
+  const [readings, setReadings] = useState<SensorReading[]>(demoReadings)
+  const [hasLiveData, setHasLiveData] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<
+    "disconnected" | "connecting" | "connected" | "error"
+  >("disconnected")
+  const [statusMessage, setStatusMessage] = useState("")
+  const [lastReceivedAt, setLastReceivedAt] = useState<Date | null>(null)
+  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  const portRef = useRef<SerialPortLike | null>(null)
+  const stoppingRef = useRef(false)
+  const currentReading = readings.at(-1)
+  const values = readings.map((reading) => reading.value)
+  const average = values.length
+    ? values.reduce((total, value) => total + value, 0) / values.length
+    : null
+  const minimum = values.length ? Math.min(...values) : null
+  const maximum = values.length ? Math.max(...values) : null
+
+  useEffect(
+    () => () => {
+      void readerRef.current?.cancel()
+      void portRef.current?.close()
+    },
+    [],
+  )
+
+  async function connectSerial() {
+    const serial = (navigator as Navigator & { serial?: WebSerialApi }).serial
+    if (!serial) {
+      setConnectionStatus("error")
+      setStatusMessage("Web Serial을 지원하는 Chrome 또는 Edge에서 열어 주세요.")
+      return
+    }
+
+    let port: SerialPortLike | null = null
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    let failed = false
+    stoppingRef.current = false
+    setConnectionStatus("connecting")
+    setStatusMessage("브라우저 포트 선택창에서 Arduino 포트를 선택해 주세요.")
+
+    try {
+      port = await serial.requestPort()
+      await port.open({ baudRate: 9600 })
+      portRef.current = port
+      reader = port.readable?.getReader() ?? null
+      if (!reader) throw new Error("선택한 포트에서 데이터를 읽을 수 없습니다.")
+
+      readerRef.current = reader
+      setReadings([])
+      setHasLiveData(false)
+      setLastReceivedAt(null)
+      setConnectionStatus("connected")
+      setStatusMessage("9600 baud로 시리얼 데이터를 기다리는 중입니다.")
+
+      const decoder = new TextDecoder()
+      let pending = ""
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        pending += decoder.decode(value, { stream: true })
+        const lines = pending.split(/\r?\n/)
+        pending = lines.pop() ?? ""
+        const received = lines
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .map(Number)
+          .filter((value) => Number.isFinite(value))
+
+        if (received.length) {
+          const receivedAt = new Date()
+          setReadings((previous) => [
+            ...previous,
+            ...received.map((value) => ({
+              time: receivedAt.toLocaleTimeString("ko-KR", {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              }),
+              value,
+            })),
+          ].slice(-100))
+          setHasLiveData(true)
+          setLastReceivedAt(receivedAt)
+          setStatusMessage("시리얼 데이터를 실시간으로 받고 있습니다.")
+        }
+      }
+    } catch (error) {
+      failed = !stoppingRef.current
+      if (failed) {
+        setConnectionStatus("error")
+        setStatusMessage(
+          error instanceof Error ? error.message : "시리얼 연결에 실패했습니다.",
+        )
+      }
+    } finally {
+      if (reader) {
+        reader.releaseLock()
+        if (readerRef.current === reader) readerRef.current = null
+      }
+      if (port) {
+        await port.close().catch(() => undefined)
+        if (portRef.current === port) portRef.current = null
+      }
+      if (!failed) {
+        setConnectionStatus("disconnected")
+        setStatusMessage("시리얼 연결이 종료되었습니다.")
+      }
+    }
+  }
+
+  function disconnectSerial() {
+    stoppingRef.current = true
+    setConnectionStatus("disconnected")
+    setStatusMessage("시리얼 연결을 종료했습니다.")
+    void readerRef.current?.cancel()
+  }
+
   return (
     <div className="min-h-screen bg-[#F4F5F9] text-slate-900">
       <div className="flex min-h-screen">
@@ -167,7 +306,7 @@ export default function App() {
             </div>
             <div>
               <p className="text-[15px] font-bold tracking-tight">
-                Flex Monitor
+                Flexsensor
               </p>
               <p className="mt-0.5 text-[11px] text-slate-400">
                 Sensor workspace
@@ -202,9 +341,15 @@ export default function App() {
               <span className="text-xs font-semibold text-slate-600">
                 연결 상태
               </span>
-              <span className="flex items-center gap-2 text-[11px] font-semibold text-emerald-600">
-                <StatusDot />
-                정상
+              <span
+                className={`flex items-center gap-2 text-[11px] font-semibold ${connectionStatus === "connected" ? "text-emerald-600" : "text-slate-400"}`}
+              >
+                {connectionStatus === "connected" && <StatusDot />}
+                {connectionStatus === "connected"
+                  ? "연결됨"
+                  : connectionStatus === "connecting"
+                    ? "연결 중"
+                    : "연결 대기"}
               </span>
             </div>
             <p className="mt-3 text-[11px] leading-relaxed text-slate-400">
@@ -222,11 +367,37 @@ export default function App() {
                 <div className="grid h-9 w-9 place-items-center rounded-xl bg-[#5B61F6] text-xs font-bold text-white">
                   FS
                 </div>
-                <span className="text-sm font-bold">Flex Monitor</span>
+                <span className="text-sm font-bold">Flexsensor</span>
               </div>
-              <div className="ml-auto flex items-center gap-2 rounded-full border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">
-                <StatusDot />
-                센서 연결됨
+              <div className="ml-auto flex items-center gap-2 sm:gap-3">
+                <div
+                  className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold ${connectionStatus === "connected" ? "border-emerald-100 bg-emerald-50 text-emerald-700" : connectionStatus === "error" ? "border-rose-200 bg-rose-50 text-rose-700" : "border-slate-200 bg-white text-slate-500"}`}
+                >
+                  {connectionStatus === "connected" && <StatusDot />}
+                  {connectionStatus === "connected"
+                    ? "시리얼 연결됨"
+                    : connectionStatus === "connecting"
+                      ? "포트 선택 중"
+                      : connectionStatus === "error"
+                        ? "연결 오류"
+                        : "시리얼 연결 안 됨"}
+                </div>
+                <button
+                  type="button"
+                  onClick={
+                    connectionStatus === "connected"
+                      ? disconnectSerial
+                      : connectSerial
+                  }
+                  disabled={connectionStatus === "connecting"}
+                  className="rounded-lg bg-[#4C51D9] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#3F44C2] disabled:cursor-wait disabled:opacity-60"
+                >
+                  {connectionStatus === "connected"
+                    ? "연결 끊기"
+                    : connectionStatus === "connecting"
+                      ? "연결 중..."
+                      : "시리얼 연결"}
+                </button>
               </div>
             </div>
           </header>
@@ -245,9 +416,20 @@ export default function App() {
                 </p>
               </div>
               <div className="flex items-center gap-2 text-xs text-slate-400">
-                <span>2025년 6월 12일</span>
+                <span>
+                  {lastReceivedAt
+                    ? lastReceivedAt.toLocaleDateString("ko-KR")
+                    : new Date().toLocaleDateString("ko-KR")}
+                </span>
                 <span className="h-3 w-px bg-slate-300" />
-                <span>14:30 기준</span>
+                <span>
+                  {lastReceivedAt
+                    ? lastReceivedAt.toLocaleTimeString("ko-KR")
+                    : new Date().toLocaleTimeString("ko-KR", {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })} 기준
+                </span>
               </div>
             </div>
 
@@ -262,49 +444,57 @@ export default function App() {
                         현재 센서값
                       </p>
                       <p className="mt-1 text-xs text-indigo-200">
-                        실시간 굽힘 각도
+                        {hasLiveData ? "시리얼 실시간 수신값" : "최근 측정값"}
                       </p>
                     </div>
                     <span className="rounded-full bg-white/12 px-3 py-1.5 text-[11px] font-semibold text-white/90 backdrop-blur">
-                      LIVE
+                      {hasLiveData ? "SERIAL" : "DEMO"}
                     </span>
                   </div>
 
                   <div className="my-auto py-7">
                     <div className="flex items-end gap-2">
-                      <strong className="text-[72px] font-bold leading-none tracking-[-0.07em] sm:text-[82px]">
-                        78
+                      <strong className="max-w-full break-all text-[64px] font-bold leading-none sm:text-[82px]">
+                        {currentReading ? currentReading.value : "--"}
                       </strong>
-                      <span className="mb-2 text-3xl font-medium text-indigo-100">
-                        °
-                      </span>
                     </div>
                     <div className="mt-5 flex items-center gap-2">
-                      <span className="rounded-md bg-white/14 px-2 py-1 text-xs font-bold">
-                        +6°
-                      </span>
                       <span className="text-xs text-indigo-100">
-                        30분 전보다 증가
+                        {readings.length > 1
+                          ? `이전 값 대비 ${currentReading!.value - readings.at(-2)!.value >= 0 ? "+" : ""}${Number((currentReading!.value - readings.at(-2)!.value).toFixed(2))}`
+                          : "첫 데이터 대기 중"}
                       </span>
                     </div>
                   </div>
 
-                  <div className="h-1.5 overflow-hidden rounded-full bg-black/10">
-                    <div className="h-full w-[78%] rounded-full bg-white" />
-                  </div>
-                  <div className="mt-2 flex justify-between text-[10px] font-medium text-indigo-200">
-                    <span>0°</span>
-                    <span>측정 범위</span>
-                    <span>100°</span>
+                  <div className="flex justify-between text-[10px] font-medium text-indigo-200">
+                    <span>최근 값</span>
+                    <span>
+                      {lastReceivedAt
+                        ? lastReceivedAt.toLocaleTimeString("ko-KR")
+                        : "샘플 데이터"}
+                    </span>
                   </div>
                 </div>
               </article>
 
               <div className="grid grid-cols-3 gap-3 sm:gap-5">
                 {[
-                  { label: "평균값", value: "62.6°", note: "오늘 기준" },
-                  { label: "최솟값", value: "42°", note: "09:00 측정" },
-                  { label: "최댓값", value: "78°", note: "14:30 측정" },
+                  {
+                    label: "평균값",
+                    value: average === null ? "--" : Number(average.toFixed(2)).toString(),
+                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                  },
+                  {
+                    label: "최솟값",
+                    value: minimum === null ? "--" : minimum.toString(),
+                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                  },
+                  {
+                    label: "최댓값",
+                    value: maximum === null ? "--" : maximum.toString(),
+                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                  },
                 ].map((item, index) => (
                   <article
                     key={item.label}
@@ -341,11 +531,17 @@ export default function App() {
                     <div className="mt-3 flex items-center gap-2">
                       <StatusDot />
                       <p className="text-lg font-bold text-slate-800">
-                        안정적으로 측정 중
+                        {connectionStatus === "connected"
+                          ? hasLiveData
+                            ? "데이터 수신 중"
+                            : "포트 연결됨"
+                          : connectionStatus === "error"
+                            ? "연결을 확인해 주세요"
+                            : "시리얼 포트 대기 중"}
                       </p>
                     </div>
                     <p className="mt-1.5 text-[11px] text-slate-400">
-                      신호 강도와 응답 속도가 정상 범위입니다.
+                      {statusMessage || "연결 버튼을 눌러 포트를 선택하세요. 속도는 9600 baud입니다."}
                     </p>
                   </div>
                   <div
@@ -369,39 +565,24 @@ export default function App() {
             <section className="mt-5 rounded-[24px] border border-slate-200/80 bg-white p-5 shadow-[0_4px_24px_rgba(15,23,42,0.035)] sm:p-7 lg:p-8">
               <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <h2 className="text-lg font-bold tracking-[-0.025em] text-slate-900">
-                    시간별 센서 변화
+                    <h2 className="text-lg font-bold tracking-[-0.025em] text-slate-900">
+                    최근 센서 변화
                   </h2>
                   <p className="mt-1 text-xs text-slate-400">
-                    오늘 측정된 굽힘 각도 추이
+                    {hasLiveData ? "최근 수신한 데이터 최대 100개" : "최근 수신한 데이터를 그래프로 표시합니다"}
                   </p>
                 </div>
-                <div className="flex items-center gap-1 rounded-xl bg-slate-100 p-1 text-xs font-semibold">
-                  <button
-                    type="button"
-                    className="rounded-lg bg-white px-3.5 py-2 text-[#4C51D9] shadow-sm"
-                  >
-                    오늘
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-lg px-3.5 py-2 text-slate-400"
-                  >
-                    7일
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-lg px-3.5 py-2 text-slate-400"
-                  >
-                    30일
-                  </button>
+                <div className="rounded-lg bg-slate-100 px-3.5 py-2 text-xs font-semibold text-slate-500">
+                  최근 100개 · 현재 {readings.length}개
                 </div>
               </div>
-              <SensorChart />
+              <SensorChart readings={readings} />
             </section>
 
             <p className="mt-5 text-center text-[11px] text-slate-400">
-              현재 화면은 예시 데이터로 표시되고 있습니다.
+              {hasLiveData
+                ? "수신 데이터는 저장하지 않으며 최근 100개만 메모리에 유지합니다."
+                : "연결 시 Arduino에서 줄바꿈으로 구분된 숫자 값을 읽습니다. 데이터베이스에는 저장되지 않습니다."}
             </p>
           </div>
         </main>
