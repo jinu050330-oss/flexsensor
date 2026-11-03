@@ -1,0 +1,10 @@
+{
+  "description": "플렉스 센서 데이터를 위한 대시보드로, 현재 측정값을 크게 표시하고 시간에 따른 변화를 선 그래프로 확인할 수 있습니다.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
