@@ -1,33 +1,47 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
+import { supabase } from "./supabase"
 
-type SensorReading = { time: string; value: number }
-type SerialPortLike = {
-  open: (options: { baudRate: number }) => Promise<void>
-  close: () => Promise<void>
-  readable: ReadableStream<Uint8Array> | null
+type SensorReading = {
+  id: string
+  createdAt: string
+  time: string
+  value: number
 }
-type WebSerialApi = { requestPort: () => Promise<SerialPortLike> }
-
-const demoReadings: SensorReading[] = [
-  { time: "09:00", value: 42 },
-  { time: "09:30", value: 48 },
-  { time: "10:00", value: 45 },
-  { time: "10:30", value: 58 },
-  { time: "11:00", value: 55 },
-  { time: "11:30", value: 64 },
-  { time: "12:00", value: 61 },
-  { time: "12:30", value: 68 },
-  { time: "13:00", value: 66 },
-  { time: "13:30", value: 74 },
-  { time: "14:00", value: 72 },
-  { time: "14:30", value: 78 },
-]
+type DatabaseReading = {
+  id: number | string
+  created_at: string
+  value: number | null
+}
 
 const chartWidth = 960
 const chartHeight = 300
 const chartPadding = { top: 24, right: 18, bottom: 40, left: 48 }
 const minScale = 20
 const maxScale = 100
+
+function toSensorReading(row: DatabaseReading): SensorReading {
+  const createdAt = row.created_at || new Date().toISOString()
+  return {
+    id: String(row.id),
+    createdAt,
+    time: new Date(createdAt).toLocaleTimeString("ko-KR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }),
+    value: Number(row.value),
+  }
+}
+
+function mergeReadings(...groups: SensorReading[][]): SensorReading[] {
+  const readingsById = new Map<string, SensorReading>()
+  for (const group of groups) {
+    for (const reading of group) readingsById.set(reading.id, reading)
+  }
+  return [...readingsById.values()]
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .slice(-100)
+}
 
 function StatusDot() {
   return (
@@ -178,16 +192,14 @@ function SensorChart({ readings }: { readings: SensorReading[] }) {
 }
 
 export default function App() {
-  const [readings, setReadings] = useState<SensorReading[]>(demoReadings)
-  const [hasLiveData, setHasLiveData] = useState(false)
+  const [readings, setReadings] = useState<SensorReading[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
-    "disconnected" | "connecting" | "connected" | "error"
-  >("disconnected")
-  const [statusMessage, setStatusMessage] = useState("")
-  const [lastReceivedAt, setLastReceivedAt] = useState<Date | null>(null)
-  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
-  const portRef = useRef<SerialPortLike | null>(null)
-  const stoppingRef = useRef(false)
+    "connecting" | "connected" | "error"
+  >("connecting")
+  const [statusMessage, setStatusMessage] = useState(
+    "Supabase에 연결하는 중입니다.",
+  )
+  const [queryError, setQueryError] = useState("")
   const currentReading = readings.at(-1)
   const values = readings.map((reading) => reading.value)
   const average = values.length
@@ -196,105 +208,75 @@ export default function App() {
   const minimum = values.length ? Math.min(...values) : null
   const maximum = values.length ? Math.max(...values) : null
 
-  useEffect(
-    () => () => {
-      void readerRef.current?.cancel()
-      void portRef.current?.close()
-    },
-    [],
-  )
-
-  async function connectSerial() {
-    const serial = (navigator as Navigator & { serial?: WebSerialApi }).serial
-    if (!serial) {
+  useEffect(() => {
+    let active = true
+    if (!supabase) {
       setConnectionStatus("error")
-      setStatusMessage("Web Serial을 지원하는 Chrome 또는 Edge에서 열어 주세요.")
+      setStatusMessage(
+        "VITE_SUPABASE_URL 또는 VITE_SUPABASE_ANON_KEY가 설정되지 않았습니다.",
+      )
       return
     }
 
-    let port: SerialPortLike | null = null
-    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
-    let failed = false
-    stoppingRef.current = false
-    setConnectionStatus("connecting")
-    setStatusMessage("브라우저 포트 선택창에서 Arduino 포트를 선택해 주세요.")
+    async function loadRecentReadings() {
+      const { data, error } = await supabase
+        .from("readings")
+        .select("id, created_at, value")
+        .order("created_at", { ascending: false })
+        .limit(100)
 
-    try {
-      port = await serial.requestPort()
-      await port.open({ baudRate: 9600 })
-      portRef.current = port
-      reader = port.readable?.getReader() ?? null
-      if (!reader) throw new Error("선택한 포트에서 데이터를 읽을 수 없습니다.")
-
-      readerRef.current = reader
-      setReadings([])
-      setHasLiveData(false)
-      setLastReceivedAt(null)
-      setConnectionStatus("connected")
-      setStatusMessage("9600 baud로 시리얼 데이터를 기다리는 중입니다.")
-
-      const decoder = new TextDecoder()
-      let pending = ""
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        pending += decoder.decode(value, { stream: true })
-        const lines = pending.split(/\r?\n/)
-        pending = lines.pop() ?? ""
-        const received = lines
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0)
-          .map(Number)
-          .filter((value) => Number.isFinite(value))
-
-        if (received.length) {
-          const receivedAt = new Date()
-          setReadings((previous) => [
-            ...previous,
-            ...received.map((value) => ({
-              time: receivedAt.toLocaleTimeString("ko-KR", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              }),
-              value,
-            })),
-          ].slice(-100))
-          setHasLiveData(true)
-          setLastReceivedAt(receivedAt)
-          setStatusMessage("시리얼 데이터를 실시간으로 받고 있습니다.")
-        }
-      }
-    } catch (error) {
-      failed = !stoppingRef.current
-      if (failed) {
-        setConnectionStatus("error")
+      if (!active) return
+      if (error) {
+        setQueryError(error.message)
         setStatusMessage(
-          error instanceof Error ? error.message : "시리얼 연결에 실패했습니다.",
+          "최근 데이터를 읽지 못했습니다. readings 테이블의 SELECT 정책을 확인하세요.",
         )
+        return
       }
-    } finally {
-      if (reader) {
-        reader.releaseLock()
-        if (readerRef.current === reader) readerRef.current = null
-      }
-      if (port) {
-        await port.close().catch(() => undefined)
-        if (portRef.current === port) portRef.current = null
-      }
-      if (!failed) {
-        setConnectionStatus("disconnected")
-        setStatusMessage("시리얼 연결이 종료되었습니다.")
-      }
-    }
-  }
 
-  function disconnectSerial() {
-    stoppingRef.current = true
-    setConnectionStatus("disconnected")
-    setStatusMessage("시리얼 연결을 종료했습니다.")
-    void readerRef.current?.cancel()
-  }
+      const recentReadings = (data ?? [])
+        .filter(
+          (row) => row.value !== null && Number.isFinite(Number(row.value)),
+        )
+        .map((row) => toSensorReading(row as DatabaseReading))
+        .reverse()
+      setReadings((previous) => mergeReadings(recentReadings, previous))
+      setQueryError("")
+    }
+
+    setStatusMessage("최근 Supabase 데이터를 불러오는 중입니다.")
+    void loadRecentReadings()
+
+    const channel = supabase
+      .channel("readings-dashboard")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "readings" },
+        (payload) => {
+          const row = payload.new as DatabaseReading
+          if (row.value === null || !Number.isFinite(Number(row.value))) return
+          const reading = toSensorReading(row)
+          setReadings((previous) => mergeReadings(previous, [reading]))
+        },
+      )
+      .subscribe((status) => {
+        if (!active) return
+        if (status === "SUBSCRIBED") {
+          setConnectionStatus("connected")
+          setStatusMessage("새 readings 행을 Realtime으로 받고 있습니다.")
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setConnectionStatus("error")
+          setStatusMessage(
+            "Realtime 연결에 실패했습니다. Supabase Realtime 설정과 SELECT 정책을 확인하세요.",
+          )
+        }
+      })
+
+    return () => {
+      active = false
+      void supabase.removeChannel(channel)
+    }
+  }, [])
 
   return (
     <div className="min-h-screen bg-[#F4F5F9] text-slate-900">
@@ -375,29 +357,11 @@ export default function App() {
                 >
                   {connectionStatus === "connected" && <StatusDot />}
                   {connectionStatus === "connected"
-                    ? "시리얼 연결됨"
+                    ? "Supabase 연결됨"
                     : connectionStatus === "connecting"
-                      ? "포트 선택 중"
-                      : connectionStatus === "error"
-                        ? "연결 오류"
-                        : "시리얼 연결 안 됨"}
+                      ? "Supabase 연결 중"
+                      : "Supabase 연결 오류"}
                 </div>
-                <button
-                  type="button"
-                  onClick={
-                    connectionStatus === "connected"
-                      ? disconnectSerial
-                      : connectSerial
-                  }
-                  disabled={connectionStatus === "connecting"}
-                  className="rounded-lg bg-[#4C51D9] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#3F44C2] disabled:cursor-wait disabled:opacity-60"
-                >
-                  {connectionStatus === "connected"
-                    ? "연결 끊기"
-                    : connectionStatus === "connecting"
-                      ? "연결 중..."
-                      : "시리얼 연결"}
-                </button>
               </div>
             </div>
           </header>
@@ -417,14 +381,14 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2 text-xs text-slate-400">
                 <span>
-                  {lastReceivedAt
-                    ? lastReceivedAt.toLocaleDateString("ko-KR")
+                  {currentReading
+                    ? new Date(currentReading.createdAt).toLocaleDateString("ko-KR")
                     : new Date().toLocaleDateString("ko-KR")}
                 </span>
                 <span className="h-3 w-px bg-slate-300" />
                 <span>
-                  {lastReceivedAt
-                    ? lastReceivedAt.toLocaleTimeString("ko-KR")
+                  {currentReading
+                    ? new Date(currentReading.createdAt).toLocaleTimeString("ko-KR")
                     : new Date().toLocaleTimeString("ko-KR", {
                         hour: "2-digit",
                         minute: "2-digit",
@@ -444,11 +408,13 @@ export default function App() {
                         현재 센서값
                       </p>
                       <p className="mt-1 text-xs text-indigo-200">
-                        {hasLiveData ? "시리얼 실시간 수신값" : "최근 측정값"}
+                        {readings.length
+                          ? "readings 최신 값"
+                          : "Supabase 값 대기 중"}
                       </p>
                     </div>
                     <span className="rounded-full bg-white/12 px-3 py-1.5 text-[11px] font-semibold text-white/90 backdrop-blur">
-                      {hasLiveData ? "SERIAL" : "DEMO"}
+                      SUPABASE
                     </span>
                   </div>
 
@@ -462,7 +428,9 @@ export default function App() {
                       <span className="text-xs text-indigo-100">
                         {readings.length > 1
                           ? `이전 값 대비 ${currentReading!.value - readings.at(-2)!.value >= 0 ? "+" : ""}${Number((currentReading!.value - readings.at(-2)!.value).toFixed(2))}`
-                          : "첫 데이터 대기 중"}
+                          : readings.length === 1
+                            ? "최근 데이터 1개"
+                            : "저장된 데이터 없음"}
                       </span>
                     </div>
                   </div>
@@ -470,9 +438,7 @@ export default function App() {
                   <div className="flex justify-between text-[10px] font-medium text-indigo-200">
                     <span>최근 값</span>
                     <span>
-                      {lastReceivedAt
-                        ? lastReceivedAt.toLocaleTimeString("ko-KR")
-                        : "샘플 데이터"}
+                      {currentReading?.time ?? "데이터 대기 중"}
                     </span>
                   </div>
                 </div>
@@ -483,17 +449,17 @@ export default function App() {
                   {
                     label: "평균값",
                     value: average === null ? "--" : Number(average.toFixed(2)).toString(),
-                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                    note: "최근 readings 기준",
                   },
                   {
                     label: "최솟값",
                     value: minimum === null ? "--" : minimum.toString(),
-                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                    note: "최근 readings 기준",
                   },
                   {
                     label: "최댓값",
                     value: maximum === null ? "--" : maximum.toString(),
-                    note: hasLiveData ? "최근 수신값 기준" : "샘플 데이터 기준",
+                    note: "최근 readings 기준",
                   },
                 ].map((item, index) => (
                   <article
@@ -529,19 +495,21 @@ export default function App() {
                       센서 상태
                     </p>
                     <div className="mt-3 flex items-center gap-2">
-                      <StatusDot />
+                      {connectionStatus === "connected" ? (
+                        <StatusDot />
+                      ) : (
+                        <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
+                      )}
                       <p className="text-lg font-bold text-slate-800">
                         {connectionStatus === "connected"
-                          ? hasLiveData
-                            ? "데이터 수신 중"
-                            : "포트 연결됨"
+                          ? "Realtime 구독 중"
                           : connectionStatus === "error"
                             ? "연결을 확인해 주세요"
-                            : "시리얼 포트 대기 중"}
+                            : "Supabase 연결 중"}
                       </p>
                     </div>
                     <p className="mt-1.5 text-[11px] text-slate-400">
-                      {statusMessage || "연결 버튼을 눌러 포트를 선택하세요. 속도는 9600 baud입니다."}
+                      {queryError || statusMessage}
                     </p>
                   </div>
                   <div
@@ -569,7 +537,7 @@ export default function App() {
                     최근 센서 변화
                   </h2>
                   <p className="mt-1 text-xs text-slate-400">
-                    {hasLiveData ? "최근 수신한 데이터 최대 100개" : "최근 수신한 데이터를 그래프로 표시합니다"}
+                    Supabase readings 테이블의 최근 value
                   </p>
                 </div>
                 <div className="rounded-lg bg-slate-100 px-3.5 py-2 text-xs font-semibold text-slate-500">
@@ -580,9 +548,7 @@ export default function App() {
             </section>
 
             <p className="mt-5 text-center text-[11px] text-slate-400">
-              {hasLiveData
-                ? "수신 데이터는 저장하지 않으며 최근 100개만 메모리에 유지합니다."
-                : "연결 시 Arduino에서 줄바꿈으로 구분된 숫자 값을 읽습니다. 데이터베이스에는 저장되지 않습니다."}
+              readings의 최신 100개 value를 표시하며, 새 행은 Realtime으로 반영됩니다.
             </p>
           </div>
         </main>

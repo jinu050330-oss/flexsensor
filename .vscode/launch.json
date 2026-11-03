@@ -10,6 +10,19 @@
             "name": "Launch Chrome against localhost",
             "url": "http://localhost:5173",
             "webRoot": "${workspaceFolder}"
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Upload Arduino readings to Supabase",
+            "program": "${workspaceFolder}/upload.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--port",
+                "COM9",
+                "--baud",
+                "9600"
+            ]
         }
     ]
 }
